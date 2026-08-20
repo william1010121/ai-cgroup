@@ -57,7 +57,11 @@ load_cfg() {
 
 # ---------- docker plumbing ----------
 require_docker() {
-  command -v docker >/dev/null 2>&1 || die "docker not found. Install OrbStack."
+  command -v docker >/dev/null 2>&1 || die "docker not found. Install OrbStack: brew install orbstack"
+  # Prefer OrbStack's socket directly; the docker context is not always active.
+  if [[ -z "${DOCKER_HOST:-}" && -S "$HOME/.orbstack/run/docker.sock" ]]; then
+    export DOCKER_HOST="unix://$HOME/.orbstack/run/docker.sock"
+  fi
   if ! docker info >/dev/null 2>&1; then
     die "Docker daemon not reachable. Start OrbStack first:  orb start"
   fi
