@@ -1,0 +1,13 @@
+# rbox per-project resource caps.
+# Applies to commands run via `rbox <cmd>`. Host is 10 cpu / 24GB,
+# but the OrbStack VM ceiling is 10 cpu / 12GB - stay under that.
+
+cpus   = 4        # hard CPU cap (cgroup v2 cpu.max)
+memory = "6g"     # hard RAM cap; exceeding it OOM-kills with exit 137
+pids   = 512      # fork-bomb guard
+image  = "rbox:local"
+
+# true  = mount node_modules as a named volume (~3.9x faster small-file I/O)
+#         but it is NOT synced back to the host, so your IDE won't see it.
+# false = plain bind mount, fully visible on the host. Default.
+isolate_node_modules = false

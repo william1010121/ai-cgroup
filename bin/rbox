@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+# rbox - per-project CPU/RAM capped sandbox for AI-driven commands on macOS.
+# Backed by OrbStack's Linux VM (cgroup v2). See README.md.
+set -uo pipefail
+
+IMAGE_DEFAULT="rbox:local"
+GLOBAL_CFG="${XDG_CONFIG_HOME:-$HOME/.config}/rbox/default.toml"
+
+die()  { printf 'rbox: %s\n' "$*" >&2; exit 1; }
+info() { printf 'rbox: %s\n' "$*" >&2; }
+
+# ---------- project identity ----------
+project_dir() {
+  local d
+  d="$(git rev-parse --show-toplevel 2>/dev/null)" || d=""
+  [[ -n "$d" ]] || d="$PWD"
+  # resolve symlinks so the hash is stable
+  (cd "$d" && pwd -P)
+}
+
+# rbox-<sanitized project name>-<8 char path hash>
+container_name() {
+  local dir="$1" base hash
+  base="$(basename "$dir" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_.-' '-' | sed 's/^[^a-z0-9]*//; s/-\+/-/g; s/-$//')"
+  [[ -n "$base" ]] || base="project"
+  hash="$(printf '%s' "$dir" | shasum -a 256 | cut -c1-8)"
+  printf 'rbox-%s-%s' "$base" "$hash"
+}
+
+# ---------- config ----------
+# Minimal TOML reader: `key = value`, strips quotes/comments. Enough for our flat schema.
+cfg_get() {
+  local key="$1" file="$2"
+  [[ -f "$file" ]] || return 1
+  sed -n -E "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*(.*)$/\1/p" "$file" \
+    | head -1 \
+    | sed -E 's/[[:space:]]*#.*$//; s/^"(.*)"$/\1/; s/^'\''(.*)'\''$/\1/; s/[[:space:]]*$//'
+}
+
+# project .rbox.toml -> global default.toml -> built-in
+load_cfg() {
+  local dir="$1" local_cfg="$1/.rbox.toml" v
+  CPUS=4; MEMORY="6g"; PIDS=512; IMAGE="$IMAGE_DEFAULT"; ISOLATE_NM="false"
+  local f
+  for f in "$GLOBAL_CFG" "$local_cfg"; do
+    [[ -f "$f" ]] || continue
+    v="$(cfg_get cpus                 "$f")" && [[ -n "$v" ]] && CPUS="$v"
+    v="$(cfg_get memory               "$f")" && [[ -n "$v" ]] && MEMORY="$v"
+    v="$(cfg_get pids                 "$f")" && [[ -n "$v" ]] && PIDS="$v"
+    v="$(cfg_get image                "$f")" && [[ -n "$v" ]] && IMAGE="$v"
+    v="$(cfg_get isolate_node_modules "$f")" && [[ -n "$v" ]] && ISOLATE_NM="$v"
+  done
+  # integer job count for parallelism env vars (round down; min 1)
+  JOBS="${CPUS%%.*}"; [[ "$JOBS" =~ ^[0-9]+$ ]] || JOBS=1; (( JOBS < 1 )) && JOBS=1
+  return 0
+}
+
+# ---------- docker plumbing ----------
+require_docker() {
+  command -v docker >/dev/null 2>&1 || die "docker not found. Install OrbStack."
+  if ! docker info >/dev/null 2>&1; then
+    die "Docker daemon not reachable. Start OrbStack first:  orb start"
+  fi
+}
+
+container_state() { docker inspect -f '{{.State.Status}}' "$1" 2>/dev/null; }
+
+ensure_container() {
+  local name="$1" dir="$2"
+  local state; state="$(container_state "$name")"
+
+  if [[ -n "$state" ]]; then
+    # Resource caps are fixed at creation time, so a changed .rbox.toml
+    # requires recreating the container - even if it is currently running.
+    local want_cpu cur_cpu want_mem cur_mem want_pids cur_pids
+    want_cpu="$(awk -v c="$CPUS" 'BEGIN{printf "%d", c*1000000000}')"
+    cur_cpu="$(docker inspect -f '{{.HostConfig.NanoCpus}}' "$name" 2>/dev/null)"
+    want_mem="$(mem_to_bytes "$MEMORY")"
+    cur_mem="$(docker inspect -f '{{.HostConfig.Memory}}' "$name" 2>/dev/null)"
+    want_pids="$PIDS"
+    cur_pids="$(docker inspect -f '{{.HostConfig.PidsLimit}}' "$name" 2>/dev/null)"
+    if [[ "$want_cpu" != "$cur_cpu" || "$want_mem" != "$cur_mem" || "$want_pids" != "$cur_pids" ]]; then
+      info "config changed - recreating container (cpus=$CPUS memory=$MEMORY pids=$PIDS)"
+      docker rm -f "$name" >/dev/null 2>&1
+    elif [[ "$state" == "running" ]]; then
+      return 0
+    else
+      docker start "$name" >/dev/null 2>&1 && return 0
+      docker rm -f "$name" >/dev/null 2>&1
+    fi
+  fi
+
+  image_exists "$IMAGE" || build_image
+
+  local -a args=(
+    -d --name "$name"
+    --label rbox.project="$dir"
+    --restart=no
+    --cpus="$CPUS"
+    --memory="$MEMORY" --memory-swap="$MEMORY"   # both: --memory alone does NOT hard-cap
+    --pids-limit="$PIDS"
+    -v "$dir:/work"
+    -w /work
+    -e MAKEFLAGS="-j${JOBS}"
+    -e CARGO_BUILD_JOBS="$JOBS"
+    -e NPM_CONFIG_JOBS="$JOBS"
+    -e UV_CONCURRENT_BUILDS="$JOBS"
+    -e RBOX=1
+  )
+  [[ "$ISOLATE_NM" == "true" ]] && args+=( -v "${name}-nm:/work/node_modules" )
+
+  docker run "${args[@]}" "$IMAGE" sleep infinity >/dev/null \
+    || die "failed to start sandbox container"
+  info "started $name (cpus=$CPUS memory=$MEMORY pids=$PIDS)"
+}
+
+mem_to_bytes() {
+  local m="${1,,}" n unit
+  n="${m%[gmk]*}"; unit="${m##*[0-9]}"
+  case "$unit" in
+    g|gb) awk -v n="$n" 'BEGIN{printf "%d", n*1024*1024*1024}' ;;
+    m|mb) awk -v n="$n" 'BEGIN{printf "%d", n*1024*1024}' ;;
+    k|kb) awk -v n="$n" 'BEGIN{printf "%d", n*1024}' ;;
+    *)    printf '%d' "$n" ;;
+  esac
+}
+
+image_exists() { docker image inspect "$1" >/dev/null 2>&1; }
+
+build_image() {
+  local ctx; ctx="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+  [[ -f "$ctx/Dockerfile" ]] || die "Dockerfile not found at $ctx"
+  info "building $IMAGE (first run only, takes a few minutes)..."
+  docker build -t "$IMAGE" "$ctx" >&2 || die "image build failed"
+}
+
+# ---------- subcommands ----------
+cmd_init() {
+  local dir="$1" tgt="$1/.rbox.toml"
+  if [[ -f "$tgt" ]]; then info "already exists: $tgt"; return 0; fi
+  local tpl; tpl="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)/templates/rbox.toml"
+  if [[ -f "$tpl" ]]; then cp "$tpl" "$tgt"; else
+    cat > "$tgt" <<'TOML'
+cpus   = 4
+memory = "6g"
+pids   = 512
+image  = "rbox:local"
+isolate_node_modules = false
+TOML
+  fi
+  info "created $tgt"
+}
+
+cmd_status() {
+  local name="$1" dir="$2"
+  local state; state="$(container_state "$name")"
+  printf 'project : %s\n' "$dir"
+  printf 'container: %s\n' "$name"
+  printf 'config   : cpus=%s memory=%s pids=%s image=%s\n' "$CPUS" "$MEMORY" "$PIDS" "$IMAGE"
+  printf 'state    : %s\n' "${state:-not created}"
+  if [[ "$state" == "running" ]]; then
+    docker stats --no-stream --format '  live   : CPU={{.CPUPerc}} MEM={{.MemUsage}} PIDS={{.PIDs}}' "$name"
+  fi
+}
+
+cmd_ls() {
+  printf '%-40s %-10s %s\n' "CONTAINER" "STATE" "PROJECT"
+  docker ps -a --filter 'name=^rbox-' \
+    --format '{{.Names}}\t{{.State}}\t{{.Label "rbox.project"}}' 2>/dev/null \
+    | while IFS=$'\t' read -r n s p; do printf '%-40s %-10s %s\n' "$n" "$s" "$p"; done
+}
+
+cmd_stop() { docker stop "$1" >/dev/null 2>&1 && info "stopped $1" || info "not running"; }
+cmd_rm()   { docker rm -f "$1" >/dev/null 2>&1 && info "removed $1" || info "nothing to remove"; }
+
+cmd_run() {
+  local name="$1" dir="$2"; shift 2
+  ensure_container "$name" "$dir"
+
+  # Run relative to the caller's cwd inside the project, not just the project root.
+  local rel="${PWD#"$dir"}"; rel="${rel#/}"
+  local workdir="/work${rel:+/$rel}"
+
+  local -a tty=()
+  [[ -t 0 && -t 1 ]] && tty=(-it)
+
+  docker exec "${tty[@]}" -w "$workdir" "$name" bash -lc "$(printf '%q ' "$@")"
+  local rc=$?
+  if (( rc == 137 )); then
+    info "exit 137 = OOM-killed: hit the ${MEMORY} RAM cap (not necessarily a bug in your command)."
+    info "raise 'memory' in ${dir}/.rbox.toml if the command legitimately needs more."
+  fi
+  return $rc
+}
+
+usage() {
+  cat <<'USAGE'
+rbox - per-project CPU/RAM capped sandbox (OrbStack + cgroup v2)
+
+  rbox <command...>   run a command inside this project's sandbox
+  rbox init           create .rbox.toml in this project
+  rbox status         show this project's container state + live usage
+  rbox ls             list rbox containers across all projects
+  rbox stop | rm      stop / remove this project's container
+  rbox build          (re)build the rbox image
+  rbox help
+
+Config: <project>/.rbox.toml -> ~/.config/rbox/default.toml -> built-in (4 cpus / 6g)
+Note: git, gh, ssh, docker must run on the host, NOT through rbox.
+USAGE
+}
+
+main() {
+  local dir name
+  dir="$(project_dir)"
+  load_cfg "$dir"
+  name="$(container_name "$dir")"
+
+  case "${1-}" in
+    ""|help|-h|--help) usage; exit 0 ;;
+    init)    cmd_init "$dir" ;;
+    status)  require_docker; cmd_status "$name" "$dir" ;;
+    ls)      require_docker; cmd_ls ;;
+    stop)    require_docker; cmd_stop "$name" ;;
+    rm)      require_docker; cmd_rm "$name" ;;
+    build)   require_docker; build_image ;;
+    *)       require_docker; cmd_run "$name" "$dir" "$@" ;;
+  esac
+}
+
+main "$@"
