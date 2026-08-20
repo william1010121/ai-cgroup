@@ -71,6 +71,7 @@ rbox uv run pytest
 | `rbox ls` | Every rbox container across all projects |
 | `rbox stop` / `rbox rm` | Stop / remove this project's container |
 | `rbox build` | Rebuild the sandbox image |
+| `rbox setup` | Re-run this project's `setup` script |
 
 ## Per-project limits
 
@@ -89,6 +90,31 @@ isolate_node_modules = false   # true = faster npm, but not visible to your IDE
 Resolution: `<project>/.rbox.toml` → `~/.config/rbox/default.toml` → built-in
 (4 CPU / 6GB). Edit the file and the container is automatically recreated with the
 new caps.
+
+## Custom toolchains (Lean, Rust, Go, ...)
+
+The sandbox runs Linux, so your macOS toolchain cannot be mounted in — Mach-O
+binaries fail with `Exec format error`. Instead, declare a `setup` script and a
+cache volume, and `rbox` installs the Linux build inside the container on first
+use:
+
+```toml
+# .rbox.toml — Lean 4
+volumes = ["elan:/root/.elan"]
+env     = ["ELAN_HOME=/root/.elan",
+           "PATH=/root/.elan/bin:/usr/local/bin:/usr/bin:/bin"]
+setup   = "curl -sSfL https://elan.lean-lang.org/elan-init.sh | sh -s -- -y --default-toolchain leanprover/lean4:v4.32.1"
+```
+
+```bash
+rbox lake build     # first run installs Lean, later runs start in <1s
+```
+
+The toolchain lives in a named volume, so it survives `rbox rm` and is not
+re-downloaded. `setup` runs once per container; `rbox setup` forces a re-run.
+
+Ready-made recipes for **Lean**, **Rust**, and **Go** are in
+[`examples/`](examples/) — copy one to your project as `.rbox.toml`.
 
 ## What must never go through rbox
 
@@ -112,6 +138,7 @@ Measured on macOS 26.3, Apple Silicon, 10 CPU / 24GB:
 | **Isolation** | Project A OOM-killed while project B ran untouched |
 | **Write-back** | Files created in the sandbox appear on the host owned by you |
 | **Real workflow** | `npm install` + `tsc` build completed; artifacts runnable on host |
+| **Custom toolchain** | Lean 4.32.1 installed via `setup`; `lake build` succeeded (8 jobs) |
 
 > [!IMPORTANT]
 > Docker's `--memory` alone does **not** hard-cap. In testing, a 400MB write under a

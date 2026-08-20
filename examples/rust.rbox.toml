@@ -1,0 +1,10 @@
+# Rust (rustup + cargo). Copy to your project as .rbox.toml
+cpus   = 4
+memory = "6g"
+pids   = 512
+image  = "rbox:local"
+
+volumes = ["cargo:/root/.cargo", "rustup:/root/.rustup"]
+env = ["CARGO_HOME=/root/.cargo", "RUSTUP_HOME=/root/.rustup", "PATH=/root/.cargo/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+
+setup = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path"

@@ -1,0 +1,17 @@
+# Lean 4 (elan + lake). Copy to your project as .rbox.toml
+# The toolchain is installed inside the container on first run and cached in a
+# named volume, so it survives `rbox rm` and is shared across rebuilds.
+#
+# Note: your macOS ~/.elan cannot be reused — those are Mach-O binaries and will
+# not execute on Linux. This installs the native aarch64-linux toolchain instead.
+
+cpus   = 4
+memory = "6g"
+pids   = 512
+image  = "rbox:local"
+
+volumes = ["elan:/root/.elan"]
+env = ["ELAN_HOME=/root/.elan", "PATH=/root/.elan/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+
+# Match the version to your project's lean-toolchain file.
+setup = "curl -sSfL https://elan.lean-lang.org/elan-init.sh | sh -s -- -y --default-toolchain leanprover/lean4:v4.32.1"

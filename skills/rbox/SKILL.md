@@ -52,6 +52,20 @@ Also skip it for trivial commands - `ls`, `cat`, `grep`, `rg`, `find`, `sed`,
 - **"Docker daemon not reachable"** means OrbStack is stopped. Tell the user to
   run `orb start`.
 
+## Custom toolchains
+
+If a command needs a toolchain the image lacks (Lean, Rust, Go, ...), do NOT try
+to mount the host's copy — macOS binaries cannot run in the Linux sandbox. Add a
+`setup` script plus a cache volume to `.rbox.toml`:
+
+```toml
+volumes = ["elan:/root/.elan"]
+env     = ["PATH=/root/.elan/bin:/usr/local/bin:/usr/bin:/bin"]
+setup   = "curl -sSfL https://elan.lean-lang.org/elan-init.sh | sh -s -- -y"
+```
+
+`setup` runs automatically on first use and is cached; `rbox setup` re-runs it.
+
 ## Managing sandboxes
 
 ```bash

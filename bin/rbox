@@ -37,18 +37,34 @@ cfg_get() {
     | sed -E 's/[[:space:]]*#.*$//; s/^"(.*)"$/\1/; s/^'\''(.*)'\''$/\1/; s/[[:space:]]*$//'
 }
 
+# Read `key = ["a", "b"]` (single line) into one item per output line.
+cfg_get_array() {
+  local key="$1" file="$2" raw
+  [[ -f "$file" ]] || return 1
+  raw="$(sed -n -E "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\[(.*)\].*$/\1/p" "$file" | head -1)"
+  [[ -n "$raw" ]] || return 1
+  printf '%s' "$raw" | tr ',' '\n' | sed -E 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^"(.*)"$/\1/; s/^'\''(.*)'\''$/\1/' | grep -v '^$'
+}
+
 # project .rbox.toml -> global default.toml -> built-in
 load_cfg() {
-  local dir="$1" local_cfg="$1/.rbox.toml" v
+  local dir="$1" local_cfg="$1/.rbox.toml" v arr
   CPUS=4; MEMORY="6g"; PIDS=512; IMAGE="$IMAGE_DEFAULT"; ISOLATE_NM="false"
+  SETUP=""; CFG_FILE=""
+  VOLUMES=(); ENVS=()
   local f
   for f in "$GLOBAL_CFG" "$local_cfg"; do
     [[ -f "$f" ]] || continue
+    CFG_FILE="$f"
     v="$(cfg_get cpus                 "$f")" && [[ -n "$v" ]] && CPUS="$v"
     v="$(cfg_get memory               "$f")" && [[ -n "$v" ]] && MEMORY="$v"
     v="$(cfg_get pids                 "$f")" && [[ -n "$v" ]] && PIDS="$v"
     v="$(cfg_get image                "$f")" && [[ -n "$v" ]] && IMAGE="$v"
     v="$(cfg_get isolate_node_modules "$f")" && [[ -n "$v" ]] && ISOLATE_NM="$v"
+    v="$(cfg_get setup                "$f")" && [[ -n "$v" ]] && SETUP="$v"
+    # arrays: volumes = ["name:/path", ...]   env = ["K=V", ...]
+    arr="$(cfg_get_array volumes "$f")" && [[ -n "$arr" ]] && { VOLUMES=(); while IFS= read -r x; do [[ -n "$x" ]] && VOLUMES+=("$x"); done <<< "$arr"; }
+    arr="$(cfg_get_array env     "$f")" && [[ -n "$arr" ]] && { ENVS=();    while IFS= read -r x; do [[ -n "$x" ]] && ENVS+=("$x");    done <<< "$arr"; }
   done
   # integer job count for parallelism env vars (round down; min 1)
   JOBS="${CPUS%%.*}"; [[ "$JOBS" =~ ^[0-9]+$ ]] || JOBS=1; (( JOBS < 1 )) && JOBS=1
@@ -89,7 +105,7 @@ ensure_container() {
     elif [[ "$state" == "running" ]]; then
       return 0
     else
-      docker start "$name" >/dev/null 2>&1 && return 0
+      if docker start "$name" >/dev/null 2>&1; then run_setup "$name"; return 0; fi
       docker rm -f "$name" >/dev/null 2>&1
     fi
   fi
@@ -113,9 +129,20 @@ ensure_container() {
   )
   [[ "$ISOLATE_NM" == "true" ]] && args+=( -v "${name}-nm:/work/node_modules" )
 
+  # user-declared persistent volumes: "toolchain:/root/.elan" -> auto-namespaced
+  local vspec vname vpath
+  for vspec in ${VOLUMES+"${VOLUMES[@]}"}; do
+    vname="${vspec%%:*}"; vpath="${vspec#*:}"
+    [[ "$vname" == /* ]] && { args+=( -v "$vspec" ); continue; }   # absolute host path
+    args+=( -v "${name}-${vname}:${vpath}" )
+  done
+  local e
+  for e in ${ENVS+"${ENVS[@]}"}; do args+=( -e "$e" ); done
+
   docker run "${args[@]}" "$IMAGE" sleep infinity >/dev/null \
     || die "failed to start sandbox container"
   info "started $name (cpus=$CPUS memory=$MEMORY pids=$PIDS)"
+  run_setup "$name"
 }
 
 mem_to_bytes() {
@@ -136,6 +163,28 @@ build_image() {
   [[ -f "$ctx/Dockerfile" ]] || die "Dockerfile not found at $ctx"
   info "building $IMAGE (first run only, takes a few minutes)..."
   docker build -t "$IMAGE" "$ctx" >&2 || die "image build failed"
+}
+
+# Run the project's `setup` script once per container lifetime.
+# Marker lives inside the container, so recreating it re-runs setup.
+run_setup() {
+  local name="$1" e
+  [[ -n "$SETUP" ]] || return 0
+  if docker exec "$name" test -f /var/lib/rbox-setup-done 2>/dev/null; then return 0; fi
+  local RBOX_PATH_VAL=""
+  for e in ${ENVS+"${ENVS[@]}"}; do [[ "$e" == PATH=* ]] && RBOX_PATH_VAL="${e#PATH=}"; done
+  info "running setup (once per container)..."
+  # A login shell sources /etc/profile, which overwrites PATH and would discard
+  # the PATH from `env` in .rbox.toml. Re-apply it, and disable command hashing
+  # so tools installed mid-script are found immediately.
+  if docker exec -w /work -e RBOX_SETUP="$SETUP" -e RBOX_PATH="$RBOX_PATH_VAL" "$name" bash -lc \
+       'set +h; [ -n "$RBOX_PATH" ] && export PATH="$RBOX_PATH"; set -e; eval "$RBOX_SETUP"' \
+       ; then
+    docker exec "$name" touch /var/lib/rbox-setup-done >/dev/null 2>&1
+    info "setup complete"
+  else
+    die "setup failed. Fix 'setup' in ${CFG_FILE:-.rbox.toml}, then run: rbox rm && rbox <cmd>"
+  fi
 }
 
 # ---------- subcommands ----------
@@ -196,7 +245,13 @@ cmd_run() {
   local -a tty=()
   [[ -t 0 && -t 1 ]] && tty=(-it)
 
-  docker exec "${tty[@]}" -w "$workdir" "$name" bash -lc "$(printf '%q ' "$@")"
+  # Re-apply the configured PATH: `bash -l` sources /etc/profile, which would
+  # otherwise discard a custom PATH set via `env` in .rbox.toml.
+  local e rbox_path=""
+  for e in ${ENVS+"${ENVS[@]}"}; do [[ "$e" == PATH=* ]] && rbox_path="${e#PATH=}"; done
+  docker exec "${tty[@]}" -w "$workdir" -e RBOX_PATH="$rbox_path" \
+    -e RBOX_CMD="$(printf '%q ' "$@")" "$name" \
+    bash -lc '[ -n "$RBOX_PATH" ] && export PATH="$RBOX_PATH"; eval "$RBOX_CMD"' 
   local rc=$?
   if (( rc == 137 )); then
     info "exit 137 = OOM-killed: hit the ${MEMORY} RAM cap (not necessarily a bug in your command)."
@@ -215,6 +270,7 @@ rbox - per-project CPU/RAM capped sandbox (OrbStack + cgroup v2)
   rbox ls             list rbox containers across all projects
   rbox stop | rm      stop / remove this project's container
   rbox build          (re)build the rbox image
+  rbox setup          re-run this project's `setup` script
   rbox help
 
 Config: <project>/.rbox.toml -> ~/.config/rbox/default.toml -> built-in (4 cpus / 6g)
@@ -236,6 +292,11 @@ main() {
     stop)    require_docker; cmd_stop "$name" ;;
     rm)      require_docker; cmd_rm "$name" ;;
     build)   require_docker; build_image ;;
+    setup)   require_docker
+             [[ -n "$SETUP" ]] || die "no 'setup' defined in .rbox.toml"
+             ensure_container "$name" "$dir"
+             docker exec "$name" rm -f /var/lib/rbox-setup-done >/dev/null 2>&1
+             run_setup "$name" ;;
     *)       require_docker; cmd_run "$name" "$dir" "$@" ;;
   esac
 }

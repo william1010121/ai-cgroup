@@ -11,3 +11,18 @@ image  = "rbox:local"
 #         but it is NOT synced back to the host, so your IDE won't see it.
 # false = plain bind mount, fully visible on the host. Default.
 isolate_node_modules = false
+
+# ---------------------------------------------------------------------------
+# Custom toolchains (Lean, Rust, Go, ...)
+#
+# Your macOS binaries cannot be reused: the sandbox runs Linux, so Mach-O
+# executables fail with "Exec format error". Install the Linux build inside the
+# container instead, and cache it in a named volume.
+#
+#   volumes = ["elan:/root/.elan"]     # persists across `rbox rm`
+#   env     = ["PATH=/root/.elan/bin:/usr/local/bin:/usr/bin:/bin"]
+#   setup   = "curl -sSfL https://elan.lean-lang.org/elan-init.sh | sh -s -- -y"
+#
+# `setup` runs once per container; re-run it with `rbox setup`.
+# Ready-made recipes: examples/ in the ai-cgroup repo.
+# ---------------------------------------------------------------------------

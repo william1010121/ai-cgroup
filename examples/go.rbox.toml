@@ -1,0 +1,10 @@
+# Go toolchain. Copy to your project as .rbox.toml
+cpus   = 4
+memory = "6g"
+pids   = 512
+image  = "rbox:local"
+
+volumes = ["gopath:/root/go", "golang:/usr/local/go"]
+env = ["GOPATH=/root/go", "PATH=/usr/local/go/bin:/root/go/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+
+setup = "curl -sSfL https://go.dev/dl/go1.24.0.linux-arm64.tar.gz | tar -C /usr/local -xz"
