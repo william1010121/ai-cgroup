@@ -182,8 +182,16 @@ cmd_run() {
   ensure_container "$name" "$dir"
 
   # Run relative to the caller's cwd inside the project, not just the project root.
-  local rel="${PWD#"$dir"}"; rel="${rel#/}"
-  local workdir="/work${rel:+/$rel}"
+  # Resolve cwd the same way project_dir does so the prefix actually matches
+  # (macOS is case-insensitive and /tmp is a symlink to /private/tmp).
+  local here rel workdir
+  here="$(pwd -P)"
+  rel="${here#"$dir"}"
+  if [[ "$rel" == "$here" ]]; then
+    rel=""              # not under $dir (case/symlink mismatch): fall back to root
+  fi
+  rel="${rel#/}"
+  workdir="/work${rel:+/$rel}"
 
   local -a tty=()
   [[ -t 0 && -t 1 ]] && tty=(-it)
